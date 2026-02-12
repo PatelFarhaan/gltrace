@@ -19,9 +19,9 @@ check: ## Validate required core dependencies (curl, jq)
 	@command -v jq >/dev/null || (echo "Missing: jq" && exit 1)
 	@echo "OK: curl + jq present"
 
-deps: ## Show optional UI dependencies status (fzf, gum)
+deps: ## Show dependency status (gum needed for no-args wizard; fzf optional)
+	@command -v gum >/dev/null && echo "OK: gum" || echo "Missing: gum (gltrace can attempt auto-install in wizard mode)"
 	@command -v fzf >/dev/null && echo "OK: fzf" || echo "Missing (optional): fzf"
-	@command -v gum >/dev/null && echo "OK: gum" || echo "Missing (optional): gum"
 
 run: ## Run pipeline mode (requires env: GITLAB_URL, GITLAB_PROJECT_ID, GITLAB_TOKEN, PIPELINE_ID)
 	@test -n "$$PIPELINE_ID" || (echo "Set PIPELINE_ID=<id>" && exit 1)

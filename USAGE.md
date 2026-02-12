@@ -1,19 +1,13 @@
 # USAGE.md
 
-Practical usage examples for `gltrace`.
+Detailed usage examples for `gltrace`.
 
----
-
-## 0) One-time setup
+## 1) Setup
 
 ```bash
 cd /Users/mpatel/projects/farhaan/gltrace
 chmod +x ./gltrace
-```
 
-Set environment variables (recommended):
-
-```bash
 export GITLAB_URL="https://gitlab.eng.roku.com"
 export GITLAB_PROJECT_ID="31043"
 export GITLAB_TOKEN="YOUR_TOKEN"
@@ -21,147 +15,140 @@ export GITLAB_TOKEN="YOUR_TOKEN"
 
 ---
 
-## 1) Basic interactive pipeline flow (most common)
+## 2) Wizard mode (no args)
 
 ```bash
-./gltrace --pipeline-id 123456
+./gltrace
 ```
 
-What happens:
-1. Shows pipeline summary
-2. Lets you select stage
-3. Lets you select job
-4. Prints logs
+Behavior:
+- Uses `gum` prompts for URL, project, token, mode, filters, selection, save options
+- If `gum` is missing, script attempts auto-install
 
 ---
 
-## 2) Direct job logs (skip pipeline navigation)
+## 3) Args mode (non-interactive)
+
+When you pass flags, prompts are disabled. Output is deterministic.
+
+### 3.1 Direct job
 
 ```bash
 ./gltrace --job-id 35012984
 ```
 
----
-
-## 3) Preselect stage (skip stage picker)
-
-```bash
-./gltrace --pipeline-id 123456 --stage build
-```
-
----
-
-## 4) Preselect both stage + job
+### 3.2 Pipeline with explicit selectors
 
 ```bash
 ./gltrace --pipeline-id 123456 --stage build --job unit-tests
 ```
 
-If unique, it goes straight to logs.
-
----
-
-## 5) Fully non-interactive (great for agents)
+### 3.3 Failed jobs only (parent pipeline)
 
 ```bash
-./gltrace --pipeline-id 123456 --stage build --job unit-tests --no-interactive
+./gltrace --pipeline-id 123456 --status failed --stage test --job integration-tests
 ```
 
-Fails if ambiguous/missing instead of prompting.
+### 3.4 Failed jobs including downstream/child pipelines
+
+```bash
+./gltrace --pipeline-id 123456 --include-downstream --status failed --stage test --job integration-tests
+```
+
+### 3.5 Success jobs only
+
+```bash
+./gltrace --pipeline-id 123456 --status success --stage deploy --job deploy-prod
+```
+
+### 3.6 Multiple statuses
+
+```bash
+./gltrace --pipeline-id 123456 --status failed,success --stage test --job smoke
+```
+
+### 3.7 Disambiguate by source child pipeline
+
+When multiple downstream pipelines have same stage/job names, first run broad and note `pipe:<id>` hints, then pin one:
+
+```bash
+./gltrace --pipeline-id 123456 --include-downstream --status failed --source-pipeline-id 7685851 --stage Apply
+```
+
+### 3.8 Fetch logs for each job
+
+Direct by job id (recommended):
+
+```bash
+./gltrace --project-id 31043 --job-id 35012984
+./gltrace --project-id 31043 --job-id 35012983
+./gltrace --project-id 31043 --job-id 35012974
+```
+
+Save each to file:
+
+```bash
+./gltrace --project-id 31043 --job-id 35012984 --output ./logs/35012984.log
+./gltrace --project-id 31043 --job-id 35012983 --output ./logs/35012983.log
+```
+
+Or via filtered selectors:
+
+```bash
+./gltrace \
+  --project-id 31043 \
+  --pipeline-id 7684859 \
+  --include-downstream \
+  --source-pipeline-id 7685851 \
+  --status failed \
+  --stage Apply \
+  --job "assign-non-virtual-repos-apply: [ava, us-east-1]"
+```
+
+If selectors are ambiguous in args mode, gltrace exits and prints matching job hints.
 
 ---
 
-## 6) Save logs to auto filename
+## 4) Save output
+
+Auto filename:
 
 ```bash
 ./gltrace --job-id 35012984 --save
 ```
 
-Creates file like:
-
-`gltrace-project31043-job35012984-YYYYMMDD-HHMMSS.log`
-
----
-
-## 7) Save logs to specific file
+Explicit file:
 
 ```bash
 ./gltrace --job-id 35012984 --output ./logs/my-job.log
 ```
 
-Also prints logs to terminal.
-
 ---
 
-## 8) Raw mode (logs only, no banners)
+## 5) Raw output / piping
 
 ```bash
 ./gltrace --job-id 35012984 --raw
-```
-
-Good for piping:
-
-```bash
 ./gltrace --job-id 35012984 --raw | tail -n 200
 ```
 
 ---
 
-## 9) Force picker type
-
-Auto mode is default (`fzf > gum > select`).
-
-```bash
-./gltrace --pipeline-id 123456 --picker fzf
-./gltrace --pipeline-id 123456 --picker gum
-./gltrace --pipeline-id 123456 --picker select
-```
-
----
-
-## 10) Use defaults from env vars for pipeline/job
-
-Pipeline default:
+## 6) Environment defaults
 
 ```bash
 export GITLAB_PIPELINE_ID="123456"
-./gltrace --stage build
-```
+./gltrace --stage build --job unit-tests
 
-Job default:
-
-```bash
 export GITLAB_JOB_ID="35012984"
 ./gltrace
 ```
 
----
-
-## 11) Override env vars with CLI flags
-
-CLI args always take precedence:
-
-```bash
-./gltrace \
-  --gitlab-url https://gitlab.example.com \
-  --project-id 99999 \
-  --pipeline-id 123456 \
-  --token ANOTHER_TOKEN
-```
+CLI flags override env vars.
 
 ---
 
-## 12) Help screen
-
-```bash
-./gltrace --help
-```
-
----
-
-## 13) Makefile shortcuts
-
-From the project directory:
+## 7) Makefile helpers
 
 ```bash
 make help
@@ -172,17 +159,3 @@ make run PIPELINE_ID=123456
 make test
 make install-local
 ```
-
-After install (if `~/.local/bin` is in your PATH):
-
-```bash
-gltrace --pipeline-id 123456
-```
-
----
-
-## Notes
-
-- Required tools: `curl`, `jq`
-- Optional tools: `fzf`, `gum`
-- Prefer env var token (`GITLAB_TOKEN`) over passing `--token` in shell history

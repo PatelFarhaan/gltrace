@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# gltrace - Interactive GitLab pipeline/job log explorer (terminal)
+
+SCRIPT_NAME="$(basename "$0")"
+
+# Config (CLI overrides env)
+GITLAB_URL="${GITLAB_URL:-}"
+PROJECT_ID="${GITLAB_PROJECT_ID:-}"
+PIPELINE_ID="${GITLAB_PIPELINE_ID:-}"
+JOB_ID="${GITLAB_JOB_ID:-}"
+TOKEN="${GITLAB_TOKEN:-}"
+
+STAGE_NAME=""
+JOB_NAME=""
+RAW=false
+NO_INTERACTIVE=false
+SAVE=false
+OUTPUT_FILE=""
+PICKER="auto" # auto|fzf|gum|select
+
+usage() {
+  cat <<EOF
+Usage:
+  $SCRIPT_NAME [options]
+
+Modes:
+  Pipeline mode (interactive or filtered):
+    $SCRIPT_NAME --pipeline-id <id> [--stage <stage>] [--job <job>] [--save]
+
+  Direct job mode:
+    $SCRIPT_NAME --job-id <id> [--save]
+
+Core options:
+  --gitlab-url <url>       GitLab base URL (e.g. https://gitlab.example.com)
+  --project-id <id>        GitLab numeric project id
+  --pipeline-id <id>       Explore jobs in a pipeline
+  --job-id <id>            Fetch a specific job trace directly
+  --token <token>          GitLab private token
+
+Selection options (pipeline mode):
+  --stage <name>           Preselect stage (skips stage picker)
+  --job <name>             Preselect job name in that stage
+
+Output options:
+  --save                   Save logs to file (auto filename if --output not given)
+  --output <path>          Save logs to explicit file path
+  --raw                    Print only logs (no banners/meta)
+
+UI options:
+  --picker <auto|fzf|gum|select>
+                           Picker preference. auto: fzf > gum > bash select
+  --no-interactive         Fail instead of prompting when stage/job not fully specified
+
+Help:
+  -h, --help               Show this help
+
+Environment variables:
+  GITLAB_URL
+  GITLAB_PROJECT_ID
+  GITLAB_PIPELINE_ID
+  GITLAB_JOB_ID
+  GITLAB_TOKEN
+EOF
+}
+
+err() { echo "❌ $*" >&2; }
+info() { echo "ℹ️  $*"; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { err "Missing required command: $1"; exit 1; }
+}
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+normalize_url() { echo "${1%/}"; }
+
+api_get() {
+  local path="$1"
+  curl --silent --show-error --fail \
+    --header "PRIVATE-TOKEN: $TOKEN" \
+    "$GITLAB_URL/api/v4$path"
+}
+
+api_get_with_headers() {
+  local path="$1" body_file="$2" headers_file="$3"
+  curl --silent --show-error --fail \
+    --dump-header "$headers_file" \
+    --output "$body_file" \
+    --header "PRIVATE-TOKEN: $TOKEN" \
+    "$GITLAB_URL/api/v4$path"
+}
+
+print_banner() {
+  [[ "$RAW" == true ]] && return
+  local title="$1"
+  if has_cmd gum; then
+    gum style --border rounded --padding "0 1" --foreground 212 "$title"
+  else
+    echo ""
+    echo "=== $title ==="
+  fi
+}
+
+detect_picker() {
+  case "$PICKER" in
+    fzf)
+      has_cmd fzf || { err "--picker fzf requested but fzf is not installed"; exit 1; }
+      echo "fzf"
+      ;;
+    gum)
+      has_cmd gum || { err "--picker gum requested but gum is not installed"; exit 1; }
+      echo "gum"
+      ;;
+    select)
+      echo "select"
+      ;;
+    auto)
+      if has_cmd fzf; then echo "fzf"; return; fi
+      if has_cmd gum; then echo "gum"; return; fi
+      echo "select"
+      ;;
+    *)
+      err "Invalid --picker value: $PICKER"
+      exit 1
+      ;;
+  esac
+}
+
+choose_one() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+
+  [[ ${#options[@]} -eq 0 ]] && { err "No options available for: $prompt"; exit 1; }
+
+  if [[ "$NO_INTERACTIVE" == true ]]; then
+    err "--no-interactive mode cannot prompt: $prompt"
+    exit 1
+  fi
+
+  local picker
+  picker="$(detect_picker)"
+
+  case "$picker" in
+    fzf)
+      printf '%s\n' "${options[@]}" | fzf --prompt "$prompt " --height 40% --reverse
+      ;;
+    gum)
+      gum choose --header "$prompt" "${options[@]}"
+      ;;
+    select)
+      PS3="$prompt "
+      select choice in "${options[@]}"; do
+        [[ -n "${choice:-}" ]] && { echo "$choice"; break; }
+        echo "Invalid selection"
+      done
+      ;;
+  esac
+}
+
+fetch_pipeline_jobs_json() {
+  local page=1 body_file headers_file next_page
+  local combined='[]'
+
+  while true; do
+    body_file="$(mktemp)"
+    headers_file="$(mktemp)"
+
+    api_get_with_headers \
+      "/projects/$PROJECT_ID/pipelines/$PIPELINE_ID/jobs?per_page=100&page=$page" \
+      "$body_file" "$headers_file"
+
+    combined="$(jq -s '.[0] + .[1]' <(echo "$combined") "$body_file")"
+
+    next_page="$(awk -F': ' 'tolower($1)=="x-next-page" {gsub(/\r/,"",$2); print $2}' "$headers_file" | tail -n1)"
+
+    rm -f "$body_file" "$headers_file"
+
+    [[ -z "${next_page:-}" ]] && break
+    page="$next_page"
+  done
+
+  echo "$combined"
+}
+
+print_pipeline_summary() {
+  [[ "$RAW" == true ]] && return
+  local jobs_json="$1"
+  local total stages
+
+  total="$(echo "$jobs_json" | jq 'length')"
+  stages="$(echo "$jobs_json" | jq -r '.[].stage' | awk '!seen[$0]++' | wc -l | tr -d ' ')"
+
+  echo "Pipeline: $PIPELINE_ID"
+  echo "Project : $PROJECT_ID"
+  echo "Jobs    : $total"
+  echo "Stages  : $stages"
+  echo ""
+}
+
+select_stage() {
+  local jobs_json="$1"
+  mapfile -t stages < <(echo "$jobs_json" | jq -r '.[].stage' | awk '!seen[$0]++')
+  choose_one "Select a stage:" "${stages[@]}"
+}
+
+resolve_stage() {
+  local jobs_json="$1"
+
+  if [[ -n "$STAGE_NAME" ]]; then
+    local count
+    count="$(echo "$jobs_json" | jq -r --arg s "$STAGE_NAME" '[ .[] | select(.stage==$s) ] | length')"
+    if [[ "$count" -eq 0 ]]; then
+      err "Stage not found in pipeline: $STAGE_NAME"
+      exit 1
+    fi
+    echo "$STAGE_NAME"
+    return
+  fi
+
+  select_stage "$jobs_json"
+}
+
+select_job_line_for_stage() {
+  local jobs_json="$1" stage="$2"
+
+  mapfile -t job_lines < <(
+    echo "$jobs_json" | jq -r --arg stage "$stage" '
+      [ .[] | select(.stage == $stage) ]
+      | sort_by(.id)
+      | .[]
+      | "\(.name) | #\(.id) | \(.status)"
+    '
+  )
+
+  choose_one "Select a job in stage '$stage':" "${job_lines[@]}"
+}
+
+resolve_job_id_from_name() {
+  local jobs_json="$1" stage="$2" job_name="$3"
+
+  local matches
+  matches="$(echo "$jobs_json" | jq -r --arg s "$stage" --arg j "$job_name" '
+    [ .[] | select(.stage==$s and .name==$j) ] | sort_by(.id)
+  ')"
+
+  local count
+  count="$(echo "$matches" | jq 'length')"
+
+  if [[ "$count" -eq 0 ]]; then
+    err "No job named '$job_name' found in stage '$stage'"
+    exit 1
+  fi
+
+  if [[ "$count" -gt 1 ]]; then
+    if [[ "$NO_INTERACTIVE" == true ]]; then
+      err "Multiple '$job_name' jobs in stage '$stage'. Use --no-interactive off or --job-id directly."
+      exit 1
+    fi
+
+    mapfile -t dup_lines < <(echo "$matches" | jq -r '.[] | "\(.name) | #\(.id) | \(.status)"')
+    local selected
+    selected="$(choose_one "Multiple matching jobs, pick one:" "${dup_lines[@]}")"
+    extract_job_id_from_line "$selected"
+    return
+  fi
+
+  echo "$matches" | jq -r '.[0].id'
+}
+
+extract_job_id_from_line() {
+  sed -E 's/.*#([0-9]+).*/\1/' <<<"$1"
+}
+
+default_output_file() {
+  local job_id="$1"
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  echo "gltrace-project${PROJECT_ID}-job${job_id}-${ts}.log"
+}
+
+fetch_job_trace() {
+  local job_id="$1"
+  api_get "/projects/$PROJECT_ID/jobs/$job_id/trace"
+}
+
+output_trace() {
+  local job_id="$1" trace="$2"
+
+  if [[ "$RAW" == false ]]; then
+    print_banner "Job Trace: #$job_id"
+  fi
+
+  if [[ "$SAVE" == true || -n "$OUTPUT_FILE" ]]; then
+    local out="${OUTPUT_FILE:-$(default_output_file "$job_id")}"
+    printf '%s\n' "$trace" > "$out"
+    [[ "$RAW" == false ]] && info "Saved log to: $out"
+  fi
+
+  printf '%s\n' "$trace"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --gitlab-url) GITLAB_URL="${2:-}"; shift 2 ;;
+      --project-id) PROJECT_ID="${2:-}"; shift 2 ;;
+      --pipeline-id) PIPELINE_ID="${2:-}"; shift 2 ;;
+      --job-id) JOB_ID="${2:-}"; shift 2 ;;
+      --token) TOKEN="${2:-}"; shift 2 ;;
+      --stage) STAGE_NAME="${2:-}"; shift 2 ;;
+      --job) JOB_NAME="${2:-}"; shift 2 ;;
+      --save) SAVE=true; shift ;;
+      --output) OUTPUT_FILE="${2:-}"; SAVE=true; shift 2 ;;
+      --picker) PICKER="${2:-}"; shift 2 ;;
+      --raw) RAW=true; shift ;;
+      --no-interactive) NO_INTERACTIVE=true; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) err "Unknown argument: $1"; usage; exit 1 ;;
+    esac
+  done
+}
+
+validate_args() {
+  require_cmd curl
+  require_cmd jq
+
+  [[ -z "$GITLAB_URL" ]] && { err "Missing gitlab url (--gitlab-url or env GITLAB_URL)"; exit 1; }
+  [[ -z "$PROJECT_ID" ]] && { err "Missing project id (--project-id or env GITLAB_PROJECT_ID)"; exit 1; }
+  [[ -z "$TOKEN" ]] && { err "Missing token (--token or env GITLAB_TOKEN)"; exit 1; }
+
+  GITLAB_URL="$(normalize_url "$GITLAB_URL")"
+
+  [[ -n "$PIPELINE_ID" && -n "$JOB_ID" ]] && { err "Use either --pipeline-id or --job-id, not both"; exit 1; }
+  [[ -z "$PIPELINE_ID" && -z "$JOB_ID" ]] && { err "Provide one: --pipeline-id or --job-id"; exit 1; }
+
+  if [[ -n "$JOB_ID" && ( -n "$STAGE_NAME" || -n "$JOB_NAME" ) ]]; then
+    err "--stage/--job are only valid with --pipeline-id"
+    exit 1
+  fi
+
+  if [[ "$NO_INTERACTIVE" == true && -n "$PIPELINE_ID" && -z "$STAGE_NAME" && -z "$JOB_NAME" ]]; then
+    err "--no-interactive with --pipeline-id requires at least --stage and/or --job (or use --job-id)"
+    exit 1
+  fi
+}
+
+main() {
+  parse_args "$@"
+  validate_args
+
+  if [[ -n "$JOB_ID" ]]; then
+    local trace
+    trace="$(fetch_job_trace "$JOB_ID")"
+    output_trace "$JOB_ID" "$trace"
+    exit 0
+  fi
+
+  print_banner "gltrace - GitLab Pipeline Log Explorer"
+
+  local jobs_json
+  jobs_json="$(fetch_pipeline_jobs_json)"
+
+  if [[ "$(echo "$jobs_json" | jq 'length')" -eq 0 ]]; then
+    err "No jobs found for pipeline $PIPELINE_ID"
+    exit 1
+  fi
+
+  print_pipeline_summary "$jobs_json"
+
+  local selected_stage selected_job_id selected_line
+  selected_stage="$(resolve_stage "$jobs_json")"
+
+  if [[ -n "$JOB_NAME" ]]; then
+    selected_job_id="$(resolve_job_id_from_name "$jobs_json" "$selected_stage" "$JOB_NAME")"
+  else
+    selected_line="$(select_job_line_for_stage "$jobs_json" "$selected_stage")"
+    selected_job_id="$(extract_job_id_from_line "$selected_line")"
+  fi
+
+  local trace
+  trace="$(fetch_job_trace "$selected_job_id")"
+  output_trace "$selected_job_id" "$trace"
+}
+
+main "$@"

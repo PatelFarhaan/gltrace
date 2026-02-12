@@ -8,7 +8,7 @@ Detailed usage examples for `gltrace`.
 cd /Users/mpatel/projects/farhaan/gltrace
 chmod +x ./gltrace
 
-export GITLAB_URL="https://gitlab.eng.roku.com"
+export GITLAB_URL="https://gitlab.com"
 export GITLAB_PROJECT_ID="31043"
 export GITLAB_TOKEN="YOUR_TOKEN"
 ```

@@ -37,7 +37,10 @@ No-args wizard mode:
   - Launches gum-based prompts for all inputs (url/project/token/mode/stage/job/status/etc)
 
 Args mode (non-interactive):
-  Pipeline mode:
+  Pipeline mode (latest pipeline):
+    $SCRIPT_NAME [--stage <stage>] [--job <job>] [--status <value[,value...]>]
+
+  Pipeline mode (specific pipeline):
     $SCRIPT_NAME --pipeline-id <id> [--stage <stage>] [--job <job>] [--status <value[,value...]>] [--include-downstream] [--source-pipeline-id <id>]
 
   Direct job mode:
@@ -46,7 +49,7 @@ Args mode (non-interactive):
 Core options:
   --gitlab-url <url>       GitLab base URL (e.g. https://gitlab.example.com)
   --project-id <id>        GitLab numeric project id
-  --pipeline-id <id>       Explore jobs in a pipeline
+  --pipeline-id <id>       Explore jobs in a pipeline (omit to use latest)
   --job-id <id>            Fetch a specific job trace directly
   --token <token>          GitLab private token
 
@@ -263,6 +266,17 @@ wizard_mode() {
 
 urlencode() {
   jq -nr --arg v "$1" '$v|@uri'
+}
+
+fetch_latest_pipeline_id() {
+  local encoded_project
+  encoded_project="$(urlencode "$PROJECT_ID")"
+  local result
+  result="$(api_get "/projects/${encoded_project}/pipelines?per_page=1&sort=desc&order_by=id")"
+  local pid
+  pid="$(echo "$result" | jq -r '.[0].id // empty')"
+  [[ -z "$pid" ]] && { err "No pipelines found for project $PROJECT_ID"; exit 1; }
+  echo "$pid"
 }
 
 fetch_pipeline_jobs_json_by_id() {
@@ -483,12 +497,11 @@ validate_args() {
 
   GITLAB_URL="$(normalize_url "$GITLAB_URL")"
   [[ -n "$PIPELINE_ID" && -n "$JOB_ID" ]] && { err "Use either --pipeline-id or --job-id, not both"; exit 1; }
-  [[ -z "$PIPELINE_ID" && -z "$JOB_ID" ]] && { err "Provide one: --pipeline-id or --job-id"; exit 1; }
 
   [[ -n "$STATUS_FILTER" ]] && parse_status_csv "$STATUS_FILTER" >/dev/null
 
   if [[ -n "$JOB_ID" && ( -n "$STAGE_NAME" || -n "$JOB_NAME" || -n "$STATUS_FILTER" || "$INCLUDE_DOWNSTREAM" == true || -n "$SOURCE_PIPELINE_ID" ) ]]; then
-    err "--stage/--job/--status/--include-downstream/--source-pipeline-id are only valid with --pipeline-id"
+    err "--stage/--job/--status/--include-downstream/--source-pipeline-id are not valid with --job-id"
     exit 1
   fi
 
@@ -515,6 +528,12 @@ main() {
     trace="$(fetch_job_trace "$PROJECT_ID" "$JOB_ID")"
     output_trace "$JOB_ID" "$trace"
     exit 0
+  fi
+
+  if [[ -z "$PIPELINE_ID" ]]; then
+    info "No pipeline ID provided, fetching latest pipeline..."
+    PIPELINE_ID="$(fetch_latest_pipeline_id)"
+    info "Using pipeline: $PIPELINE_ID"
   fi
 
   print_banner "gltrace - GitLab Pipeline Log Explorer"
